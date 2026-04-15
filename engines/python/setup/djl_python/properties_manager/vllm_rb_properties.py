@@ -67,7 +67,7 @@ class VllmRbProperties(Properties):
     # The following configs have different defaults, or additional processing in DJL compared to vLLM
     dtype: str = "auto"
     max_loras: int = 4
-    task: str = 'auto'
+    task: str = 'auto'  # DJL-facing property; mapped to vLLM runner/convert
     # The following configs have broken processing in vllm via the FlexibleArgumentParser
     long_lora_scaling_factors: Optional[Tuple[float, ...]] = None
     # Tool calling properties
@@ -97,10 +97,34 @@ class VllmRbProperties(Properties):
     @field_validator('task')
     def validate_task(cls, task):
         # TODO: conflicts between HF and VLLM tasks, need to separate these.
-        # for backwards compatibility, max text-generation to generate
+        # for backwards compatibility, map text-generation to generate
         if task == 'text-generation':
             task = 'generate'
         return task
+
+    def _map_task_to_runner_convert(self) -> dict:
+        """Map the DJL 'task' property to vLLM 0.15+ runner/convert args.
+
+        vLLM >=0.15 replaced the single 'task' arg with:
+          - runner: auto | generate | pooling | draft
+          - convert: auto | none | embed | classify | reward | mm_encoder_only
+        """
+        task = self.task
+        RUNNER_VALUES = {'auto', 'generate', 'pooling', 'draft'}
+        CONVERT_VALUES = {'auto', 'none', 'embed', 'classify', 'reward', 'mm_encoder_only'}
+
+        if task in CONVERT_VALUES:
+            # e.g. task=embed -> convert=embed, runner=auto
+            return {'convert': task, 'runner': 'auto'}
+        if task in RUNNER_VALUES:
+            return {'runner': task, 'convert': 'auto'}
+        # Legacy HF task names
+        if task in ('text-generation', 'generate'):
+            return {'runner': 'generate', 'convert': 'auto'}
+        if task in ('feature-extraction',):
+            return {'runner': 'pooling', 'convert': 'embed'}
+        # Fallback: let vLLM auto-detect
+        return {'runner': 'auto', 'convert': 'auto'}
 
     @field_validator('dtype')
     def validate_dtype(cls, val):
@@ -194,6 +218,9 @@ class VllmRbProperties(Properties):
             'cpu_offload_gb': self.cpu_offload_gb_per_gpu,
             'quantization': self.quantize,
         }
+        # Map DJL task to vLLM runner/convert (vLLM >=0.15 API)
+        runner_convert = self._map_task_to_runner_convert()
+        vllm_engine_args.update(runner_convert)
         if self.max_rolling_batch_prefill_tokens is not None:
             vllm_engine_args[
                 'max_num_batched_tokens'] = self.max_rolling_batch_prefill_tokens

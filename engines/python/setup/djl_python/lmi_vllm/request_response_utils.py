@@ -290,3 +290,14 @@ def lmi_stream_output_formatter(
     **kwargs,
 ) -> Tuple[str, bool, List[str]]:
     return convert_completion_chunk_response_to_lmi_schema(chunk, **kwargs)
+
+
+def embedding_non_stream_output_formatter(response, **_) -> Output:
+    """Format embedding response as JSON output."""
+    import json as _json
+    if isinstance(response, dict):
+        return create_non_stream_output(_json.dumps(response))
+    if hasattr(response, 'message'):
+        return create_non_stream_output(
+            "", error=response.message, code=getattr(response, 'code', 500))
+    return create_non_stream_output(str(response))
