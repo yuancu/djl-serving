@@ -10,9 +10,11 @@
 # or in the "LICENSE.txt" file accompanying this file. This file is distributed on an "AS IS"
 # BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, express or implied. See the License for
 # the specific language governing permissions and limitations under the License.
+import asyncio
 import logging
 import os
 import types
+import uuid
 from typing import Optional, Union, AsyncGenerator
 
 from vllm import AsyncLLMEngine
@@ -75,6 +77,8 @@ class VLLMHandler(AdapterFormatterMixin):
         self.initialized = False
         self.lora_id_counter = AtomicCounter(0)
         self.lora_requests = {}
+        self.is_embedding = False
+        self._lazy_load_locks = {}  # v3.1: per-adapter locks for lazy re-registration
 
     async def initialize(self, properties: dict):
         self.hf_configs = HuggingFaceProperties(**properties)
@@ -125,6 +129,18 @@ class VLLMHandler(AdapterFormatterMixin):
             self.vllm_engine_args)
         self.tokenizer = self.vllm_engine.get_tokenizer()
 
+        # Detect embedding task: check both DJL 'task' and vLLM 'convert' properties
+        task = properties.get("task", "auto")
+        if task == "embed":
+            self.is_embedding = True
+            logger.info("Embedding mode enabled (task=embed) — skipping completion/chat services")
+        elif not self.is_embedding:
+            # Also check the vLLM engine args for convert=embed
+            convert_val = getattr(self.vllm_engine_args, 'convert', 'auto')
+            if convert_val == 'embed':
+                self.is_embedding = True
+                logger.info("Embedding mode enabled (convert=embed) — skipping completion/chat services")
+
         model_names = self.vllm_engine_args.served_model_name or "lmi"
         if not isinstance(model_names, list):
             model_names = [model_names]
@@ -140,24 +156,25 @@ class VLLMHandler(AdapterFormatterMixin):
             self.vllm_engine,
             base_model_paths,
         )
-        self.completion_service = OpenAIServingCompletion(
-            self.vllm_engine,
-            self.model_registry,
-            request_logger=None,
-        )
+        if not self.is_embedding:
+            self.completion_service = OpenAIServingCompletion(
+                self.vllm_engine,
+                self.model_registry,
+                request_logger=None,
+            )
 
-        self.chat_completion_service = OpenAIServingChat(
-            self.vllm_engine,
-            self.model_registry,
-            "assistant",
-            request_logger=None,
-            chat_template=self.vllm_properties.chat_template,
-            chat_template_content_format=self.vllm_properties.
-            chat_template_content_format,
-            enable_auto_tools=self.vllm_properties.enable_auto_tool_choice,
-            tool_parser=self.vllm_properties.tool_call_parser,
-            reasoning_parser=self.vllm_properties.reasoning_parser,
-        )
+            self.chat_completion_service = OpenAIServingChat(
+                self.vllm_engine,
+                self.model_registry,
+                "assistant",
+                request_logger=None,
+                chat_template=self.vllm_properties.chat_template,
+                chat_template_content_format=self.vllm_properties.
+                chat_template_content_format,
+                enable_auto_tools=self.vllm_properties.enable_auto_tool_choice,
+                tool_parser=self.vllm_properties.tool_call_parser,
+                reasoning_parser=self.vllm_properties.reasoning_parser,
+            )
         if properties.get("enable_stateful_sessions", "true") == "true":
             self.session_manager: SessionManager = SessionManager(properties)
         self.initialized = True
@@ -172,7 +189,23 @@ class VLLMHandler(AdapterFormatterMixin):
                 return True
         return self.output_formatter is not None
 
-    def preprocess_request(self, inputs: Input) -> ProcessedRequest:
+    async def _encode_single(self, text, pooling_params, request_id, lora_request=None):
+        """Encode a single text and return embedding vector."""
+        final_output = None
+        async for output in self.vllm_engine.encode(
+            text, pooling_params, request_id, lora_request=lora_request
+        ):
+            final_output = output
+        if final_output is None:
+            raise RuntimeError(f"No output from encode for request {request_id}")
+        data = final_output.outputs.data
+        if hasattr(data, 'tolist'):
+            return data.tolist()
+        if hasattr(final_output.outputs, 'embedding'):
+            return final_output.outputs.embedding
+        return list(data)
+
+    async def preprocess_request(self, inputs: Input) -> ProcessedRequest:
         batch = inputs.get_batches()
         assert len(batch) == 1, "only one request per batch allowed"
         raw_request = batch[0]
@@ -199,15 +232,88 @@ class VLLMHandler(AdapterFormatterMixin):
         lora_request = None
         if adapter_name:
             if adapter_name not in self.lora_requests:
-                raise ValueError(
-                    f"LoRA adapter {adapter_name} not found in registry. Available adapters: {list(self.lora_requests.keys())}"
-                )
+                # v3.1 fix: handle race condition with concurrent register_adapter()
+                # Phase 1: Yield to event loop to let queued register_adapter() run.
+                # add_lora() writes to self.lora_requests BEFORE its first await,
+                # so a few yields is usually enough.
+                for _attempt in range(5):
+                    await asyncio.sleep(0.01)  # 10ms per attempt, 50ms max
+                    if adapter_name in self.lora_requests:
+                        logger.info(
+                            f"v3.1: Adapter {adapter_name} became available "
+                            f"after {(_attempt + 1) * 10}ms wait"
+                        )
+                        break
+
+            if adapter_name not in self.lora_requests:
+                # Phase 2: Still not found — try lazy re-registration from disk.
+                # On SageMaker IC, adapter files live at /opt/ml/models/<name>/model/
+                if adapter_name not in self._lazy_load_locks:
+                    self._lazy_load_locks[adapter_name] = asyncio.Lock()
+                async with self._lazy_load_locks[adapter_name]:
+                    # Double-check after acquiring lock (another request may have loaded it)
+                    if adapter_name not in self.lora_requests:
+                        adapter_path = f"/opt/ml/models/{adapter_name}/model"
+                        if os.path.isdir(adapter_path):
+                            logger.info(
+                                f"v3.1: Lazy-registering adapter {adapter_name} "
+                                f"from {adapter_path}"
+                            )
+                            await self.add_lora(adapter_name, adapter_name, adapter_path)
+                            logger.info(
+                                f"v3.1: Lazy registration of {adapter_name} succeeded"
+                            )
+                        else:
+                            raise ValueError(
+                                f"LoRA adapter {adapter_name} not found in registry "
+                                f"and no model files at {adapter_path}. "
+                                f"Available: {list(self.lora_requests.keys())}"
+                            )
             lora_request = get_lora_request(adapter_name, self.lora_requests)
             logging.info(
                 f"Using LoRA request: {lora_request.lora_name} (ID: {lora_request.lora_int_id})"
             )
             # Set the model field to the adapter name so vLLM's _maybe_get_adapters() can extract it
             decoded_payload["model"] = adapter_name
+
+        # --- Embedding mode: intercept ALL requests ---
+        if self.is_embedding:
+            texts = decoded_payload.get("inputs") or decoded_payload.get("input") or decoded_payload.get("prompt", "")
+            if isinstance(texts, str):
+                texts = [texts]
+
+            _lora_request = lora_request  # capture for closure
+            _texts = texts
+
+            async def embedding_invoke(_request):
+                from vllm import PoolingParams
+                pp = PoolingParams(task='embed')
+                tasks = []
+                for text in _texts:
+                    rid = str(uuid.uuid4())
+                    tasks.append(self._encode_single(text, pp, rid, _lora_request))
+                embeddings = await asyncio.gather(*tasks)
+                return {
+                    "object": "list",
+                    "data": [{"object": "embedding", "index": i, "embedding": emb}
+                             for i, emb in enumerate(embeddings)],
+                    "model": decoded_payload.get("model", self.model_name),
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }
+
+            from djl_python.lmi_vllm.request_response_utils import embedding_non_stream_output_formatter
+            processed_request = ProcessedRequest(
+                None,
+                embedding_invoke,
+                embedding_non_stream_output_formatter,
+                None,
+                False,
+                False,
+            )
+            processed_request.lora_request = lora_request
+            processed_request.adapter_name = adapter_name
+            return processed_request
+        # --- End embedding mode ---
 
         # completions request
         if "prompt" in decoded_payload:
@@ -270,7 +376,7 @@ class VLLMHandler(AdapterFormatterMixin):
             inputs: Input) -> Union[Output, AsyncGenerator[Output, None]]:
         await self.check_health()
         try:
-            processed_request = self.preprocess_request(inputs)
+            processed_request = await self.preprocess_request(inputs)
         except CustomFormatterError as e:
             logger.exception("Custom formatter failed")
             return create_non_stream_output(
@@ -365,9 +471,8 @@ custom_service = None
 service = VLLMHandler()
 
 
-async def handle(
-        inputs: Input
-) -> Optional[Union[Output, AsyncGenerator[Output, None]]]:
+async def handle(inputs: Input) -> Optional[Union[Output, AsyncGenerator[Output, None]]]:
+    """Async entry point — DJL's PythonAsyncEngine awaits this directly."""
     global custom_service
     # Initialize custom service once
     if custom_service is None:
@@ -391,7 +496,6 @@ async def handle(
     return outputs
 
 
-# Adapter management functions
 async def register_adapter(inputs: Input):
     return await service.register_adapter(inputs)
 
